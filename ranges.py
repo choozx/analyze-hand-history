@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""🃏 오픈 레인지 드릴 — 프리플랍 RFI 차트를 상대로 한 속사 문제.
+
+`quiz.py`(핸드 리뷰 문제)와 같은 위상의 형제 모듈이지만 성격이 정반대다:
+
+  - quiz.py  : 출제는 로컬, **채점은 AI** (정답이 하나로 정해지지 않는 포스트플랍)
+  - ranges.py: 출제도 채점도 **전부 로컬** — 정답이 차트에 박혀 있으므로 AI 호출 0회
+
+'폴드로 돌아온 상황에서 이 핸드를 오픈하나?'만 묻는다. 포지션 × 스택버킷마다 오픈
+레인지를 하나씩 들고 있고, 고른 답을 차트와 대조해 즉시 채점한다.
+
+## 차트에 대한 정직한 설명
+
+여기 박혀 있는 레인지는 **솔버 실시간 출력이 아니라 공개된 MTT 참고 차트의 근사**다.
+이 앱은 표준 라이브러리 전용이라 솔버를 돌리거나 외부에서 받아올 방법이 없다. 안티
+크기·필드 구성·ICM에 따라 경계는 얼마든지 움직이므로, 경계 핸드는 `mix`(혼합)로 따로
+표시해 **오픈이든 폴드든 [무난]**으로 채점한다. 확실한 구간만 [좋음]/[실수]가 된다.
+차트를 고칠 일이 생기면 아래 표기법 문자열만 고치면 된다 — 파서가 169조합으로 편다.
+
+## 내 실전 기록과의 연결
+
+`pf_faced == "none"`(폴드 투 히어로 = 오픈 기회)인 핸드를 포지션×스택×조합으로 묶어,
+**차트와 어긋나게 친 조합을 우선 출제**한다 (`_hero_rfi`). 범용 차트 암기가 아니라 내
+리크를 때리는 드릴이 되게 하는 부분. `pf_faced`/`stack_bb`가 없는 구 DB에서는 이 가중치가
+자동으로 꺼지고 균등 무작위 출제로 떨어진다 — 두 상태 모두 동작해야 한다.
+
+의존 방향: convert ← store ← ranges ← gui (quiz.py와 같은 위상, 서로 참조하지 않는다)
+"""
+
+import random
+import re
+import time
+
+import store
+
+RANKS = "AKQJT98765432"
+_RI = {r: i for i, r in enumerate(RANKS)}     # A=0 … 2=12 (작을수록 높은 랭크)
+
+MAX_ATTEMPTS = 500    # DB에 남기는 응시 기록 수 (DB는 클라우드 동기화 대상 — 작게 유지)
+RECENT_SKIP = 24      # 최근 이만큼 안에 나온 조합은 다시 잘 안 나오게 가중치를 낮춘다
+
+
+# ---------------------------------------------------------------------------
+# 레인지 표기법 파서 — "22+, A2s+, KTs+, AQo+" → 169조합 집합
+# ---------------------------------------------------------------------------
+
+def _label(hi, lo, suited):
+    """랭크 두 개 → store._combo와 **같은 표기**의 조합 라벨 (AA / AKs / AKo)."""
+    if hi == lo:
+        return hi + lo
+    if _RI[hi] > _RI[lo]:
+        hi, lo = lo, hi
+    return hi + lo + ("s" if suited else "o")
+
+
+def _pair_span(a, b):
+    i, j = sorted((_RI[a], _RI[b]))
+    return {RANKS[k] * 2 for k in range(i, j + 1)}
+
+
+def _expand_token(tok):
+    if "-" in tok:                                  # 77-TT / A5s-A2s / K5o-K7o
+        a, b = tok.split("-", 1)
+        if len(a) == 2 and len(b) == 2:
+            return _pair_span(a[0], b[0])
+        if len(a) != 3 or len(b) != 3 or a[0] != b[0] or a[2] != b[2]:
+            raise ValueError(f"레인지 표기 오류: {tok}")
+        i, j = sorted((_RI[a[1]], _RI[b[1]]))
+        return {_label(a[0], RANKS[k], a[2] == "s") for k in range(i, j + 1)}
+    plus = tok.endswith("+")
+    if plus:
+        tok = tok[:-1]
+    if len(tok) == 2:                               # 77 / 77+
+        if tok[0] != tok[1]:
+            raise ValueError(f"페어 표기 오류: {tok}")
+        return _pair_span("A", tok[0]) if plus else {tok[0] * 2}
+    if len(tok) != 3 or tok[2] not in "so":
+        raise ValueError(f"조합 표기 오류: {tok}")
+    hi, lo, suit = tok[0], tok[1], tok[2] == "s"
+    if plus:                                        # A2s+ → A2s..AKs (탑 랭크 고정)
+        return {_label(hi, RANKS[k], suit) for k in range(_RI[hi] + 1, _RI[lo] + 1)}
+    return {_label(hi, lo, suit)}
+
+
+def expand(notation):
+    """표기법 문자열 → 조합 라벨 집합."""
+    out = set()
+    for tok in notation.replace(" ", "").split(","):
+        if tok:
+            out |= _expand_token(tok)
+    return out
+
+
+def combo_weight(combo):
+    """그 조합이 차지하는 실제 카드 콤보 수 (페어 6 / 수딧 4 / 오프수딧 12)."""
+    if len(combo) == 2:
+        return 6
+    return 4 if combo.endswith("s") else 12
+
+
+def all_combos():
+    """169개 조합 라벨 (그리드 순서: 위/왼쪽이 높은 랭크, 우상단 수딧)."""
+    out = []
+    for i in range(13):
+        for j in range(13):
+            hi, lo = RANKS[min(i, j)], RANKS[max(i, j)]
+            out.append(_label(hi, lo, i < j) if i != j else RANKS[i] * 2)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 차트 — 포지션 × 스택버킷별 오픈(=RFI) 레인지
+#
+# open: 확실히 오픈하는 구간, mix: 경계(오픈/폴드 어느 쪽도 [무난])
+# 스택버킷은 store._stack_bucket과 같은 키를 쓴다: pf(<15) / short(15–25) /
+# mid(25–40) / deep(40+). pf 구간은 '레이즈'가 아니라 **푸시(올인)** 레인지다.
+# MP1/MP2/MP3은 _norm_pos로 MP 하나에 묶인다 (앱 전체가 그렇게 다룬다).
+# ---------------------------------------------------------------------------
+
+RFI = {
+    "UTG": {
+        "deep": ("22+, A6s+, A5s-A2s, KTs+, QTs+, JTs, T9s, 98s, AQo+, AJo, KQo",
+                 "K9s, Q9s, J9s, 87s, KJo, ATo"),
+        "mid": ("22+, A6s+, A5s-A2s, KTs+, QTs+, JTs, T9s, 98s, AQo+, KQo",
+                "K9s, Q9s, J9s, 87s, AJo, KJo"),
+        "short": ("22+, A8s+, A5s-A2s, KTs+, QJs, JTs, AJo+, KQo",
+                  "A7s-A6s, K9s, Q9s, T9s, 98s, ATo, KJo"),
+        "pf": ("22+, A2s+, K9s+, QTs+, JTs, T9s, ATo+, KJo+",
+               "K8s-K7s, Q9s, J9s, 98s, A9o, KTo, QJo"),
+    },
+    "MP": {
+        "deep": ("22+, A2s+, K9s+, Q9s+, J9s+, T8s+, 97s+, 87s, 76s, ATo+, KQo",
+                 "K8s, Q8s, J8s, T7s, 86s, 65s, A9o, KJo, QJo"),
+        "mid": ("22+, A2s+, K9s+, Q9s+, J9s+, T9s, 98s, ATo+, KQo",
+                "K8s, Q8s, J8s, T8s, 87s, 76s, A9o, KJo, QJo"),
+        "short": ("22+, A2s+, K9s+, Q9s+, JTs, T9s, ATo+, KJo+",
+                  "K8s, Q9s, J9s, 98s, 87s, A9o, KTo, QJo"),
+        "pf": ("22+, A2s+, K7s+, Q9s+, J9s+, T9s, A9o+, KTo+, QJo",
+               "K6s, Q8s, J8s, 98s, 87s, A8o, K9o, QTo, JTo"),
+    },
+    "CO": {
+        "deep": ("22+, A2s+, K5s+, Q7s+, J7s+, T7s+, 97s+, 86s+, 75s+, 65s, 54s, "
+                 "A9o+, KJo+, QJo",
+                 "K4s, Q6s, J6s, T6s, 64s, 53s, 43s, A8o, KTo, QTo, JTo, T9o"),
+        "mid": ("22+, A2s+, K7s+, Q8s+, J7s+, T8s+, 97s+, 87s, 76s, 65s, "
+                "A9o+, KJo+, QJo",
+                "K6s, Q7s, J6s, T7s, 86s, 75s, 54s, A8o, KTo, QTo, JTo"),
+        "short": ("22+, A2s+, K7s+, Q8s+, J8s+, T8s+, 98s, 87s, A8o+, KJo+, QJo",
+                  "K6s, Q7s, J7s, T7s, 76s, 65s, KTo, QTo, JTo"),
+        "pf": ("22+, A2s+, K5s+, Q8s+, J8s+, T8s+, 97s+, 87s, 76s, A7o+, KTo+, QJo",
+               "K4s, Q7s, J7s, T7s, 86s, 65s, 54s, A6o, K9o, QTo, JTo, T9o"),
+    },
+    "BTN": {
+        "deep": ("22+, A2s+, K2s+, Q4s+, J6s+, T6s+, 95s+, 85s+, 74s+, 63s+, 53s+, 43s, "
+                 "A2o+, K7o+, Q9o+, J9o+, T9o",
+                 "Q3s-Q2s, J5s-J4s, T5s, 94s, 84s, 73s, 62s, 52s, 42s, 32s, "
+                 "K6o-K5o, Q8o, J8o, T8o, 98o"),
+        "mid": ("22+, A2s+, K2s+, Q4s+, J6s+, T6s+, 96s+, 86s+, 75s+, 64s+, 54s, "
+                "A2o+, K7o+, Q9o+, J9o+, T9o",
+                "Q3s-Q2s, J5s, T5s, 95s, 85s, 74s, 63s, 53s, 43s, "
+                "K6o, Q8o, J8o, T8o, 98o"),
+        "short": ("22+, A2s+, K2s+, Q4s+, J6s+, T7s+, 96s+, 86s+, 75s+, 64s+, 54s, "
+                  "A2o+, K8o+, Q9o+, J9o+, T9o",
+                  "Q3s, J5s, T6s, 95s, 85s, 74s, 53s, 43s, "
+                  "K7o, Q8o, J8o, 98o"),
+        "pf": ("22+, A2s+, K2s+, Q4s+, J6s+, T6s+, 96s+, 86s+, 75s+, 65s, 54s, "
+               "A2o+, K7o+, Q9o+, J9o+, T9o",
+               "Q3s-Q2s, J5s, T5s, 95s, 85s, 74s, 64s, 53s, 43s, "
+               "K6o-K5o, Q8o, J8o, T8o, 98o"),
+    },
+    "SB": {
+        "deep": ("22+, A2s+, K2s+, Q2s+, J5s+, T6s+, 95s+, 85s+, 75s+, 64s+, 54s, "
+                 "A2o+, K8o+, Q9o+, JTo",
+                 "J4s-J2s, T5s, 94s, 84s, 74s, 63s, 53s, 43s, "
+                 "K7o-K5o, Q8o, J9o, T9o, 98o"),
+        "mid": ("22+, A2s+, K2s+, Q2s+, J5s+, T6s+, 96s+, 86s+, 75s+, 64s+, 54s, "
+                "A2o+, K8o+, Q9o+, J9o+, JTo",
+                "J4s-J2s, T5s, 95s, 85s, 74s, 63s, 53s, 43s, "
+                "K7o-K6o, Q8o, J8o, T9o"),
+        "short": ("22+, A2s+, K2s+, Q3s+, J6s+, T6s+, 96s+, 86s+, 75s+, 65s, 54s, "
+                  "A2o+, K8o+, Q9o+, J9o+, T9o",
+                  "Q2s, J5s, T5s, 95s, 85s, 74s, 64s, 53s, "
+                  "K7o, Q8o, J8o, 98o"),
+        "pf": ("22+, A2s+, K2s+, Q3s+, J5s+, T6s+, 95s+, 85s+, 75s+, 64s+, 54s, "
+               "A2o+, K6o+, Q8o+, J8o+, T8o, 98o",
+               "Q2s, J4s, T5s, 94s, 84s, 74s, 63s, 53s, 43s, "
+               "K5o-K4o, Q7o, J7o, T7o, 97o, 87o"),
+    },
+    # 헤즈업(버튼=SB). 스택이 어떻든 거의 다 오픈하므로 한 장으로 충분하다.
+    "SB(BTN)": {
+        "deep": ("22+, A2s+, K2s+, Q2s+, J2s+, T2s+, 92s+, 82s+, 72s+, 62s+, 52s+, "
+                 "42s+, 32s, A2o+, K2o+, Q2o+, J4o+, T5o+, 95o+, 85o+, 75o+, 64o+, 54o",
+                 "J3o-J2o, T4o-T3o, 94o-93o, 84o-83o, 74o-73o, 63o, 53o"),
+    },
+}
+
+# 차트가 없는 버킷은 가장 가까운 것으로 대체 (헤즈업은 한 장뿐이다)
+_BUCKET_FALLBACK = {"deep": ["deep", "mid", "short", "pf"],
+                    "mid": ["mid", "deep", "short", "pf"],
+                    "short": ["short", "mid", "pf", "deep"],
+                    "pf": ["pf", "short", "mid", "deep"]}
+
+POS_ORDER = ["UTG", "MP", "CO", "BTN", "SB", "SB(BTN)"]
+STACK_ORDER = ["pf", "short", "mid", "deep"]
+STACK_LABEL = {"pf": "<15bb", "short": "15–25bb", "mid": "25–40bb", "deep": "40bb+"}
+POS_KO = {"UTG": "UTG (얼리)", "MP": "MP (미들)", "CO": "CO (컷오프)",
+          "BTN": "BTN (버튼)", "SB": "SB (스몰블라인드)", "SB(BTN)": "SB/BTN (헤즈업)"}
+
+_CHART_CACHE = {}
+
+
+def _norm_pos(pos):
+    """MP1/MP2/MP3 → MP (차트 조회용). quiz._norm_pos와 같은 규칙."""
+    if not pos:
+        return None
+    return "MP" if pos.startswith("MP") else pos
+
+
+# 빈도 → 판정. 0.75 이상이면 확실한 오픈, 0.25 이하면 확실한 폴드, 사이는 경계(혼합).
+OPEN_HI, FOLD_LO = 0.75, 0.25
+
+
+def _class(w):
+    return "open" if w >= OPEN_HI else ("fold" if w <= FOLD_LO else "mix")
+
+
+def _builtin_weights(pos, bucket_used):
+    """내장 표기법 차트 → 빈도 dict. 내장 차트의 경계는 빈도 0.5로 본다."""
+    open_s, mix_s = RFI[pos][bucket_used]
+    opens = expand(open_s)
+    mixes = expand(mix_s) - opens         # 표기가 겹치면 오픈이 이긴다
+    w = {c: 1.0 for c in opens}
+    w.update({c: 0.5 for c in mixes})
+    return w
+
+
+def _summary(weights):
+    """(빈도 가중 오픈 비율 %, 경계 구간이 차지하는 비율 %)."""
+    pct = sum(w * combo_weight(c) for c, w in weights.items()) / 1326 * 100
+    mix = sum(combo_weight(c) for c, w in weights.items()
+              if FOLD_LO < w < OPEN_HI) / 1326 * 100
+    return round(pct, 1), round(mix, 1)
+
+
+def _charts(db):
+    return ((db or {}).get("ranges") or {}).get("charts") or {}
+
+
+def chart(pos, bucket, db=None):
+    """(포지션, 스택버킷) → 차트. db를 주면 **가져온 차트가 내장 차트를 덮어쓴다**.
+
+    차트의 실체는 `weights` (조합 → 0~1 빈도) 하나뿐이다. 내장 표기법 차트도
+    open=1.0 / mix=0.5로 같은 모양에 맞춰 들어오므로, 아래 로직은 출처를 구분하지
+    않는다 — GTO 툴에서 가져온 혼합 빈도가 그대로 채점에 반영된다.
+
+    버킷 대체는 가져온 차트와 내장 차트를 같은 사슬에서 훑는다: 예를 들어 헤즈업은
+    내장 차트가 deep 한 장뿐이라, short를 가져오면 short가 그 자리를 차지한다."""
+    pos = _norm_pos(pos)
+    table = RFI.get(pos)
+    if not table:
+        return None
+    custom = _charts(db)
+    weights = source = None
+    for b in _BUCKET_FALLBACK.get(bucket, STACK_ORDER):
+        cu = custom.get(f"{pos}|{b}")
+        if cu and cu.get("weights"):
+            weights = {k: float(v) for k, v in cu["weights"].items()}
+            source, bucket_used = cu.get("source") or "가져온 차트", b
+            break
+        if b in table:
+            key = (pos, b)
+            if key not in _CHART_CACHE:
+                _CHART_CACHE[key] = _builtin_weights(pos, b)
+            weights, bucket_used = _CHART_CACHE[key], b
+            break
+    if weights is None:
+        return None
+    pct, mix_pct = _summary(weights)
+    return {
+        "pos": pos, "stack": bucket, "chart_stack": bucket_used,
+        "weights": weights, "source": source,
+        "pct": pct, "mix_pct": mix_pct,
+        # 15bb 미만은 레이즈가 아니라 푸시폴드 구간이라 묻는 액션 자체가 다르다
+        "verb": "올인" if bucket == "pf" else "오픈",
+        "label": f"{pos} · {STACK_LABEL.get(bucket, '?')}",
+    }
+
+
+def verdict(pos, bucket, combo, db=None):
+    """차트가 이 조합을 어떻게 보는지: "open" / "mix" / "fold" (차트 없으면 None)."""
+    c = chart(pos, bucket, db)
+    if not c or not combo:
+        return None
+    return _class(c["weights"].get(combo, 0.0))
+
+
+_ALL = frozenset(all_combos())
+
+
+# ---------------------------------------------------------------------------
+# 레인지 텍스트 가져오기 — GTO 툴에서 뽑은 문자열을 그대로 받아 차트로 삼는다
+# ---------------------------------------------------------------------------
+
+def parse_range(text):
+    """레인지 텍스트 → ({조합: 빈도 0~1}, 경고 목록). 형식을 관대하게 받는다.
+
+    섞여 있어도 되는 형태:
+      ``AA, AKs, AKo``            그냥 목록 (빈도 1.0)
+      ``AA:1, ATo:0.5``           빈도 (0~1)
+      ``AA:100, ATo:50``          빈도 (0~100)
+      ``22+, A2s+, A5s-A2s``      내장 차트와 같은 표기법 축약
+      ``AhKs``                    실제 카드 2장 — 169조합으로 접는다
+
+    0~1 스케일과 0~100 스케일은 **값 하나로는 구분되지 않는다**(``AA:1``이 100%인지
+    1%인지). 그래서 토큰별이 아니라 **전체 최대값**으로 판정한다 — 최대가 1을 넘으면
+    % 스케일. 이래야 ``AA:1, AKo:0.5``도, ``AA:100, AKo:50``도 옳게 읽힌다.
+
+    구분자는 콤마·공백·줄바꿈·세미콜론 아무거나. 빈도 구분자는 ``:`` ``=`` ``@``."""
+    src = re.sub(r"\s*([:=@])\s*", r"\1", text or "")
+    raw, warnings = [], []
+    for tok in re.split(r"[,\s;]+", src):
+        if not tok:
+            continue
+        w, left = None, tok
+        for sep in (":", "=", "@"):
+            if sep in tok:
+                left, right = tok.rsplit(sep, 1)
+                try:
+                    w = float(right.rstrip("%"))
+                except ValueError:
+                    left, w = tok, None
+                break
+        combos = _combos_of(left)
+        if combos is None:
+            if len(warnings) < 12:
+                warnings.append(tok)
+            continue
+        raw.append((combos, 1.0 if w is None else w))
+
+    if not raw:
+        return {}, warnings
+    # 최대값이 1을 넘으면 0~100 스케일 (위 docstring 참고)
+    scale = 100.0 if max(w for _, w in raw) > 1.0 else 1.0
+    out = {}
+    for combos, w in raw:
+        w = max(0.0, min(1.0, w / scale))
+        if w <= 0:
+            continue
+        for c in combos:
+            out[c] = max(out.get(c, 0.0), w)      # 같은 조합이 겹치면 큰 쪽
+    return out, warnings
+
+
+def _combos_of(tok):
+    """토큰 하나 → 조합 집합 (못 읽으면 None). 카드 2장 표기도 받아준다."""
+    t = tok.strip()
+    if not t:
+        return None
+    # AhKs 처럼 실제 카드 두 장 → store._combo 로 169조합에 접는다
+    if len(t) == 4 and re.fullmatch(r"[2-9TJQKAtjqka][shdcSHDC]{1}[2-9TJQKAtjqka][shdcSHDC]", t):
+        c = store._combo([t[0].upper() + t[1].lower(), t[2].upper() + t[3].lower()])
+        return {c} if c else None
+    t = re.sub(r"[2-9tjqka]", lambda m: m.group(0).upper(), t)   # 랭크만 대문자로
+    t = t.replace("S", "s").replace("O", "o")
+    try:
+        got = _expand_token(t)
+    except (ValueError, KeyError, IndexError):
+        return None
+    return got if got and got <= _ALL else None
+
+
+def import_chart(db, pos, bucket, text, source=None):
+    """가져온 레인지를 (포지션, 스택버킷) 슬롯에 저장. 내장 차트를 덮어쓴다."""
+    pos = _norm_pos(pos)
+    if pos not in RFI:
+        return {"error": f"알 수 없는 포지션: {pos}"}
+    if bucket not in STACK_ORDER:
+        return {"error": f"알 수 없는 스택 구간: {bucket}"}
+    weights, warnings = parse_range(text)
+    if not weights:
+        return {"error": "레인지를 하나도 읽지 못했습니다. 형식을 확인해 주세요.",
+                "warnings": warnings}
+    _state_mut(db)["charts"][f"{pos}|{bucket}"] = {
+        "weights": {k: round(v, 4) for k, v in sorted(weights.items())},
+        "source": (source or "").strip() or "가져온 차트",
+        "ts": time.strftime("%Y-%m-%d %H:%M"),
+    }
+    pct, mix_pct = _summary(weights)
+    return {"ok": True, "pos": pos, "stack": bucket, "n": len(weights),
+            "pct": pct, "mix_pct": mix_pct, "warnings": warnings}
+
+
+def delete_chart(db, pos, bucket):
+    """가져온 차트를 지우고 내장 차트로 되돌린다."""
+    got = _state_mut(db)["charts"].pop(f"{_norm_pos(pos)}|{bucket}", None)
+    return {"ok": got is not None}
+
+
+def custom_slots(db):
+    """가져온 차트 목록 (UI의 슬롯 표시·삭제용)."""
+    out = []
+    for key, c in sorted(_charts(db).items()):
+        pos, _, bucket = key.partition("|")
+        pct, mix_pct = _summary({k: float(v) for k, v in (c.get("weights") or {}).items()})
+        out.append({"pos": pos, "stack": bucket,
+                    "stack_label": STACK_LABEL.get(bucket, bucket),
+                    "n": len(c.get("weights") or {}), "pct": pct, "mix_pct": mix_pct,
+                    "source": c.get("source"), "ts": c.get("ts")})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 내 실전 RFI 기록 — 차트와 어긋난 조합을 찾아 출제 가중치로 쓴다
+# ---------------------------------------------------------------------------
+
+_HERO_CACHE = {"n": None, "data": None}
+
+
+def personalized(db):
+    """내 기록으로 가중치를 줄 수 있는 DB인지 (`--rebuild` 여부).
+
+    `pf_faced`가 없으면 '폴드 투 히어로'를 판정할 수 없어 균등 출제로 떨어진다."""
+    for r in db.get("hands", {}).values():
+        return "pf_faced" in r and "stack_bb" in r
+    return False
+
+
+def _hero_rfi(db):
+    """(포지션, 스택버킷, 조합) → [오픈 횟수, 기회 횟수].
+
+    '기회' = pf_faced가 "none"(폴드 투 히어로), '오픈' = rfi 플래그.
+    수만 핸드를 훑으므로 핸드 수를 키로 캐시한다 (임포트로만 늘어난다)."""
+    hands = db.get("hands", {})
+    if _HERO_CACHE["n"] == len(hands) and _HERO_CACHE["data"] is not None:
+        return _HERO_CACHE["data"]
+    data = {}
+    for r in hands.values():
+        if r.get("pf_faced") != "none":
+            continue
+        pos = _norm_pos(r.get("hero_pos"))
+        sb = store._stack_bucket(r.get("stack_bb"))
+        combo = store._combo(r.get("hero_cards") or [])
+        if not pos or not sb or not combo:
+            continue
+        e = data.setdefault((pos, sb, combo), [0, 0])
+        e[1] += 1
+        if r.get("rfi"):
+            e[0] += 1
+    _HERO_CACHE.update({"n": len(hands), "data": data})
+    return data
+
+
+def hero_record(db, pos, bucket, combo):
+    """그 조합을 실제로 어떻게 쳤는지 (기회 없으면 None)."""
+    e = _hero_rfi(db).get((_norm_pos(pos), bucket, combo))
+    if not e or not e[1]:
+        return None
+    return {"opens": e[0], "opps": e[1], "rate": round(e[0] / e[1] * 100)}
+
+
+# ---------------------------------------------------------------------------
+# 출제
+# ---------------------------------------------------------------------------
+
+def _contexts(positions=None, stacks=None):
+    """출제 대상 (포지션, 스택버킷) 조합. 빈 필터 = 전체."""
+    positions = set(positions or ()) or set(POS_ORDER)
+    stacks = set(stacks or ()) or set(STACK_ORDER)
+    return [(p, s) for p in POS_ORDER if p in positions
+            for s in STACK_ORDER if s in stacks]
+
+
+def _recent_combos(db):
+    return {(a.get("pos"), a.get("stack"), a.get("combo"))
+            for a in _state(db)["attempts"][-RECENT_SKIP:]}
+
+
+_SUITS = "shdc"
+
+
+def _deal(combo):
+    """조합 라벨 → 실제 카드 두 장 (수딧/오프수딧에 맞는 무늬를 무작위로)."""
+    if len(combo) == 2:
+        s1, s2 = random.sample(_SUITS, 2)
+        return [combo[0] + s1, combo[1] + s2]
+    hi, lo, suited = combo[0], combo[1], combo[2] == "s"
+    if suited:
+        s = random.choice(_SUITS)
+        return [hi + s, lo + s]
+    s1, s2 = random.sample(_SUITS, 2)
+    return [hi + s1, lo + s2]
+
+
+def next_question(db, positions=None, stacks=None):
+    """다음 오픈 레인지 문제. AI 호출 없음 — 전부 로컬에서 만든다.
+
+    가중치: 기본 1. 내 실전 기록이 차트와 어긋날수록 크게 (최대 ×9), 이미 차트대로
+    잘 치고 있는 조합은 작게 (×0.4) — 아는 걸 계속 묻지 않기 위해서다.
+    최근에 나온 조합은 ×0.15로 눌러 같은 문제가 연달아 나오는 걸 막는다."""
+    ctxs = _contexts(positions, stacks)
+    if not ctxs:
+        return {"error": "선택한 조합에 해당하는 차트가 없습니다."}
+    hero = _hero_rfi(db) if personalized(db) else {}
+    recent = _recent_combos(db)
+
+    pool, weights = [], []
+    for pos, bucket in ctxs:
+        c = chart(pos, bucket, db)
+        if not c:
+            continue
+        for combo in all_combos():
+            # 차트 빈도가 곧 목표치다 — 가져온 차트의 혼합 빈도(0.62 등)도 그대로 쓴다
+            target = c["weights"].get(combo, 0.0)
+            w = 1.0
+            rec = hero.get((pos, bucket, combo))
+            if rec and rec[1]:
+                dev = abs(rec[0] / rec[1] - target)
+                conf = min(1.0, rec[1] / 4)      # 표본 4회면 최대 신뢰
+                w = 1.0 + 8.0 * dev * conf if dev > 0.25 else 0.4
+            if (pos, bucket, combo) in recent:
+                w *= 0.15
+            pool.append((pos, bucket, combo))
+            weights.append(w)
+    if not pool:
+        return {"error": "출제할 차트가 없습니다."}
+
+    pos, bucket, combo = random.choices(pool, weights=weights)[0]
+    c = chart(pos, bucket, db)
+    verb = c["verb"]
+    return {"question": {
+        "pos": pos, "stack": bucket, "combo": combo,
+        "cards": _deal(combo),
+        "pos_label": POS_KO.get(pos, pos),
+        "stack_label": STACK_LABEL.get(bucket, "?"),
+        "verb": verb,
+        "chart_source": c.get("source"),
+        "prompt": ("헤즈업, 상대 BB. " if pos == "SB(BTN)"
+                   else "앞이 전부 폴드하고 나에게 왔습니다. "),
+        "choices": [
+            {"id": "open", "label": f"{verb}" + ("(푸시)" if verb == "올인" else "(레이즈)")},
+            {"id": "fold", "label": "폴드"},
+        ],
+    }}
+
+
+# ---------------------------------------------------------------------------
+# 채점 — 전부 로컬. 차트가 정답이므로 AI가 필요 없다.
+# ---------------------------------------------------------------------------
+
+GRADE_OK, GRADE_MIX, GRADE_BAD = "좋음", "무난", "실수"
+
+
+def grade(db, pos, bucket, combo, choice, record=True):
+    """고른 액션을 차트와 대조해 채점하고 응시 기록을 남긴다."""
+    c = chart(pos, bucket, db)
+    if not c:
+        return {"error": "해당 포지션·스택 차트가 없습니다."}
+    if combo not in _ALL:
+        return {"error": f"알 수 없는 조합: {combo}"}
+    freq = c["weights"].get(combo, 0.0)
+    v, verb = _class(freq), c["verb"]
+    # 0/1이 아닌 빈도는 그 자체가 정보다 — 가져온 차트에서만 나온다
+    fs = f" (차트 빈도 {freq * 100:.0f}% {verb})" if 0.0 < freq < 1.0 else ""
+    if v == "mix":
+        g = GRADE_MIX
+        head = f"{combo}는 이 구간의 **경계 핸드**입니다{fs} — {verb}도 폴드도 됩니다."
+    elif choice == v:
+        g = GRADE_OK
+        head = (f"{combo}는 차트상 **{verb}** 구간입니다{fs}." if v == "open"
+                else f"{combo}는 차트상 **폴드** 구간입니다{fs}.")
+    else:
+        g = GRADE_BAD
+        head = (f"{combo}는 차트상 **{verb}** 구간인데 폴드했습니다{fs}." if v == "open"
+                else f"{combo}는 차트상 **폴드** 구간인데 {verb}했습니다{fs}.")
+
+    lines = [head,
+             f"{c['pos']} · {STACK_LABEL.get(bucket, '?')} {verb} 레인지는 상위 "
+             f"**{c['pct']}%** (경계 {c['mix_pct']}% 포함)."]
+    if c.get("source"):
+        lines.append(f"차트 출처: **{c['source']}**"
+                     + ("" if c["chart_stack"] == bucket
+                        else f" ({STACK_LABEL.get(c['chart_stack'])} 차트로 대체)"))
+    rec = hero_record(db, pos, bucket, combo)
+    if rec:
+        lines.append(f"실전 기록: 이 스팟에서 {combo} {rec['opps']}회 중 "
+                     f"{rec['opens']}회 {verb} (**{rec['rate']}%**).")
+    if record:
+        record_attempt(db, pos, bucket, combo, choice, g)
+    return {"grade": g, "correct": v, "verb": verb, "freq": round(freq, 3),
+            "text": "\n".join(lines), "hero": rec, "source": c.get("source"),
+            "pct": c["pct"], "mix_pct": c["mix_pct"]}
+
+
+# ---------------------------------------------------------------------------
+# 차트 보기 (13×13 그리드)
+# ---------------------------------------------------------------------------
+
+def chart_view(db, pos, bucket):
+    """그리드용 셀 맵. 내 실전 오픈 비율을 같이 실어 차트와 겹쳐 볼 수 있게 한다."""
+    c = chart(pos, bucket, db)
+    if not c:
+        return {"error": "해당 포지션·스택 차트가 없습니다."}
+    hero = _hero_rfi(db) if personalized(db) else {}
+    cells = {}
+    for combo in all_combos():
+        w = c["weights"].get(combo, 0.0)
+        cell = {"v": _class(w), "w": round(w, 3)}
+        e = hero.get((_norm_pos(pos), bucket, combo))
+        if e and e[1]:
+            cell.update({"opens": e[0], "opps": e[1],
+                         "rate": round(e[0] / e[1] * 100)})
+        cells[combo] = cell
+    return {"pos": c["pos"], "stack": bucket, "chart_stack": c["chart_stack"],
+            "label": c["label"], "verb": c["verb"], "source": c.get("source"),
+            "pct": c["pct"], "mix_pct": c["mix_pct"], "cells": cells}
+
+
+# ---------------------------------------------------------------------------
+# 응시 기록 · 성적표
+# ---------------------------------------------------------------------------
+
+def _state(db):
+    """읽기 전용 — **DB를 건드리지 않는다** (클라우드 푸시 중 최상위 키가 늘면
+    업로드가 통째로 실패한다. quiz._state와 같은 이유)."""
+    q = db.get("ranges") or {}
+    return {"attempts": q.get("attempts") or []}
+
+
+def _state_mut(db):
+    q = db.setdefault("ranges", {})
+    q.setdefault("attempts", [])
+    q.setdefault("charts", {})          # 가져온 차트: "POS|bucket" → {weights, source, ts}
+    return q
+
+
+def record_attempt(db, pos, bucket, combo, choice, g):
+    q = _state_mut(db)
+    q["attempts"].append({
+        "ts": time.strftime("%Y-%m-%d %H:%M"),
+        "pos": pos, "stack": bucket, "combo": combo, "choice": choice, "grade": g,
+    })
+    if len(q["attempts"]) > MAX_ATTEMPTS:
+        del q["attempts"][:len(q["attempts"]) - MAX_ATTEMPTS]
+
+
+def scoreboard(db):
+    attempts = _state(db)["attempts"]
+    grades = {GRADE_OK: 0, GRADE_MIX: 0, GRADE_BAD: 0}
+    by_pos = {}
+    for a in attempts:
+        if a.get("grade") in grades:
+            grades[a["grade"]] += 1
+        p = a.get("pos") or "?"
+        s = by_pos.setdefault(p, {"pos": p, "n": 0, "ok": 0})
+        s["n"] += 1
+        if a.get("grade") in (GRADE_OK, GRADE_MIX):
+            s["ok"] += 1
+    n = sum(grades.values())
+    return {
+        "total": len(attempts),
+        "grades": grades,
+        # 경계 핸드는 어느 쪽을 골라도 무난이므로 정답률 분자에 넣는다
+        "ok_rate": round((grades[GRADE_OK] + grades[GRADE_MIX]) / n * 100) if n else None,
+        "by_pos": sorted(by_pos.values(),
+                         key=lambda s: POS_ORDER.index(s["pos"])
+                         if s["pos"] in POS_ORDER else 9),
+        "recent": attempts[-12:][::-1],
+    }
+
+
+def state_view(db):
+    """UI 초기 상태 — 토글 선택지와 성적표."""
+    return {
+        # n=None → 프론트 토글이 개수 배지/흐림 처리를 하지 않는다 (차트는 항상 있다)
+        "positions": [{"key": p, "label": p, "n": None} for p in POS_ORDER],
+        "stacks": [{"key": s, "label": STACK_LABEL[s], "n": None} for s in STACK_ORDER],
+        "personalized": personalized(db),
+        "custom": custom_slots(db),
+        "scoreboard": scoreboard(db),
+    }
+
+
+if __name__ == "__main__":                        # 차트 점검용 (python3 ranges.py)
+    print(f"{'포지션':<9}{'스택':>9}  {'오픈%':>7} {'경계%':>7}  {'폴드칸':>6}")
+    for p in POS_ORDER:
+        for b in STACK_ORDER:
+            c = chart(p, b)
+            bad = set(c["weights"]) - _ALL
+            assert not bad, f"{p}/{b}: 알 수 없는 조합 {bad}"
+            # 전부 open/mix면 [실수]가 나올 수 없는 차트다 — 드릴로서 무의미
+            folds = sum(1 for x in _ALL if _class(c["weights"].get(x, 0.0)) == "fold")
+            assert folds, f"{p}/{b}: 폴드 구간이 없다"
+            fb = "" if c["chart_stack"] == b else f"  ←{c['chart_stack']}"
+            print(f"{p:<9}{STACK_LABEL[b]:>9}  {c['pct']:>6.1f}% "
+                  f"{c['mix_pct']:>6.1f}%  {folds:>5}칸{fb}")

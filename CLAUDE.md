@@ -29,7 +29,7 @@ There are no tests, linters, or CI. Verify changes by running `gui.py` against `
 
 ## Architecture
 
-Modules, strict dependency direction `convert ← store ← {bankroll, quiz} ← gui`:
+Modules, strict dependency direction `convert ← store ← {bankroll, quiz, ranges} ← gui`:
 
 - **`convert.py`** — the parser. Regex-based, line-by-line. `parse_hand(text)` → `Hand` dataclass;
   `split_hands(text)` splits a file on `CoinPoker Hand #`. Also renders markdown (`render_markdown`,
@@ -40,6 +40,8 @@ Modules, strict dependency direction `convert ← store ← {bankroll, quiz} ←
   as one big `INDEX_HTML` string (HTML+CSS+vanilla JS). Also holds the AI backends and prompts.
 - **`bankroll.py`** — the **real-money** domain (kept strictly separate from chip EV; see below).
 - **`quiz.py`** — the 🎯 문제 풀기 domain: leak-spot detection + question picking (see below).
+- **`ranges.py`** — the 📐 오픈 레인지 drill: preflop RFI charts + **local** grading (see below).
+  A sibling of `quiz.py`; the two never import each other.
 
 ### Bankroll (real money) — a parallel domain to the hands
 
@@ -117,6 +119,56 @@ JSON parsed by `_quiz_parse_gen`). Generated questions are ephemeral — never w
 
 API: `GET /api/quiz/spots` · `/api/quiz/next?spot=` · `/api/quiz/reveal?hand_id=&didx=` ·
 `POST /api/quiz/grade` (streams) · `/api/quiz/gen`.
+
+### 📐 오픈 레인지 드릴 (`ranges.py`) — 차트가 정답, AI 호출 0회
+
+The second mode of the 🎯 문제 풀기 tab (`QUIZ.mode = 'hand' | 'range'`, same `SEL = -7`). Where
+`quiz.py` is "출제 로컬, 채점 AI", this one is **local end to end** — the answer is in a chart, so
+grading is deterministic and costs nothing. Don't route it through an AI backend.
+
+`RFI[pos][bucket] = (open_notation, mix_notation)` holds 24 charts (UTG/MP/CO/BTN/SB × the four
+`store._stack_bucket` keys, plus one shared `SB(BTN)` heads-up chart that every bucket falls back
+to via `_BUCKET_FALLBACK`). The strings are expanded to 169-combo sets by `expand()` (`22+`,
+`A2s+`, `A5s-A2s`, `K5o-K7o`) and cached; labels match `store._combo` exactly, so hand-grid data
+and chart data join on the same keys. `mix` is the boundary band: **either answer grades [무난]**.
+`mix -= open`, so an overlap in the notation is harmless.
+
+The charts are **approximations of published MTT reference charts, not solver output** — this app
+is stdlib-only and offline. That's why the `mix` band exists and why the drill never claims more
+precision than it has. `python3 ranges.py` prints every chart's open%/mix% for a sanity check after
+an edit; it also asserts every token expands to a real combo. Two properties worth preserving: no
+chart should be all open+mix (nothing left to grade [실수] — the heads-up chart hit this once), and
+open% should stay near the position's usual MTT RFI (UTG ~15 / CO ~25 / BTN ~44 / SB ~41).
+
+**`pf` (<15bb) asks about a shove, not a raise** — `chart()` returns `verb = "올인"` there and the
+whole UI follows that field. Don't hardcode "오픈" in text that a pf question can reach.
+
+Personalization: `_hero_rfi(db)` groups hands with `pf_faced == "none"` (folded to hero = open
+opportunity) by (position, stack bucket, combo) and `next_question` weights a combo up to ×9 when
+hero's actual open rate disagrees with the chart, ×0.4 when it already agrees, ×0.15 if it came up
+in the last `RECENT_SKIP` attempts. Needs `pf_faced`/`stack_bb`, so `personalized()` **auto-disables
+on un-rebuilt DBs** and the drill silently falls back to uniform random — both states must keep
+working, same rule as `quiz.freq_available()`. The scan is cached on hand count (`_HERO_CACHE`).
+
+The 13×13 chart grid is fetched **only after grading** (`/api/range/chart`) — showing it earlier
+leaks the answer, the same invariant as `quiz.reveal()`.
+
+`db["ranges"]["attempts"]` (capped 500) is separate from `db["quiz"]["attempts"]` on purpose: the
+two modes grade on different scales and the scoreboards must not be averaged together.
+
+**Importing real GTO-tool ranges.** `ranges.parse_range` reads pasted range text leniently — plain
+combo lists, `combo:freq` (0–1 or 0–100, scale inferred from the max value seen), or the same
+shorthand notation the built-in charts use (`22+`, `A5s-A2s`) — and `import_chart` stores the result
+at `db["ranges"]["charts"]["POS|bucket"]`, which `chart()` prefers over the built-in `RFI` table
+(falling back through `_BUCKET_FALLBACK` the same way). This is how the "차트가 아니라 근사"
+disclaimer above gets superseded per slot: paste a solver-accurate range in and that (pos, bucket)
+grades against it instead. The 📐 오픈 레인지 탭 has a collapsible "레인지 가져오기" panel
+(`rgImportHtml`/`rgImport`) for this — paste, pick pos/stack, import; imported slots list there with
+a delete-back-to-builtin button. `delete_chart` removes a custom slot.
+
+API: `GET /api/range/state` · `/api/range/next?pos=&stack=` · `/api/range/chart?pos=&stack=` ·
+`POST /api/range/grade` (plain JSON, no streaming) · `/api/range/import`
+(`{pos, stack, text, source}`) · `/api/range/delete-chart` (`{pos, stack}`).
 
 ### ⏱ 토너먼트 타이머 — frontend-only, no server state
 

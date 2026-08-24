@@ -24,6 +24,7 @@ import bankroll
 import cloud_sync
 import convert
 import quiz
+import ranges
 import store
 
 
@@ -529,6 +530,38 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .qz-score span { color: var(--dim); font-size: 12px; }
   .qz-score b { display: block; font-size: 19px; font-variant-numeric: tabular-nums; margin-top: 2px; }
   .qz-note { color: var(--dim); font-size: 12px; margin-bottom: 12px; line-height: 1.6; }
+  /* 📐 오픈 레인지 드릴 — 채점이 로컬이라 스트리밍 영역이 없고 카드 한 장으로 끝난다 */
+  .rg-ctx { text-align: center; color: var(--dim); font-size: 13px; }
+  .rg-ctx b { color: var(--text); font-size: 15px; }
+  .rg-hero { display: flex; align-items: center; justify-content: center; gap: 10px;
+             margin: 16px 0 6px; }
+  .rg-c { width: 62px; height: 86px; border-radius: 8px; background: #f4f6fa; color: #14161a;
+          display: flex; flex-direction: column; align-items: center; justify-content: center;
+          font-weight: 800; font-size: 27px; line-height: 1.02;
+          box-shadow: 0 3px 10px rgba(0,0,0,.5); }
+  .rg-c.red { color: #cf2438; }
+  .rg-combo { text-align: center; color: var(--dim); font-size: 12px; }
+  .rg-acts { display: flex; gap: 10px; justify-content: center; margin-top: 18px; flex-wrap: wrap; }
+  .rg-acts button { min-width: 148px; padding: 12px 16px; font-size: 15px; font-weight: 700; }
+  .rg-acts button.picked { border-color: #ffa657; background: rgba(255,166,87,.12); }
+  .rg-key { opacity: .5; font-weight: 500; font-size: 12px; margin-left: 7px; }
+  .rg-res { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px;
+            font-size: 13px; line-height: 1.75; }
+  .rg-res .why { color: var(--dim); }
+  .rg-res .why b { color: var(--text); }
+  .rg-legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--dim); font-size: 12px;
+               margin: 8px 0 10px; }
+  .rg-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+                 margin-right: 5px; vertical-align: middle; font-style: normal; }
+  .hgrid .hc.rg-cur { outline: 2px solid #ffa657; outline-offset: -2px; }
+  .hgrid .hc.rg-dev { box-shadow: inset 0 0 0 1px #ff6b7d; }
+  .rg-imp select, .rg-imp textarea { background: var(--panel2); border: 1px solid var(--border);
+               color: var(--text); border-radius: 6px; padding: 6px 9px; font-size: 13px; }
+  .rg-imp textarea { font-family: ui-monospace, monospace; resize: vertical; }
+  .rg-imp-row { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+                padding: 6px 0; border-top: 1px solid var(--border); }
+  .rg-imp-row span:first-child { font-size: 13px; flex: 0 0 auto; }
+  .rg-imp-row span:nth-child(2) { color: var(--dim); font-size: 12px; flex: 1; }
 
   .ai-box { margin-top: 14px; border-top: 1px dashed var(--border); padding-top: 12px; }
   .ai-result { background: rgba(77,163,255,.05); border: 1px solid rgba(77,163,255,.25);
@@ -2689,6 +2722,7 @@ function renderTimer() {
 // AI가 채점한다. 미래 정보(실제 액션·결과)는 채점이 끝난 뒤에만 서버에서 따로 받아온다.
 // ─────────────────────────────────────────────────────────────
 let QUIZ = {
+  mode: 'hand',     // hand(핸드 리뷰, AI 채점) | range(오픈 레인지, 로컬 채점)
   status: 'idle',   // idle | loading | ready | grading | graded | error
   spots: null,      // /api/quiz/spots 응답
   pos: [],          // 히어로 포지션 필터 (빈 배열 = 전체)
@@ -2703,17 +2737,26 @@ let QUIZ = {
 };
 
 function qzSidebarMeta() {
-  const s = QUIZ.spots && QUIZ.spots.scoreboard;
-  if (!s || !s.total) return '내 약점 스팟으로 AI가 문제 출제';
+  // 두 모드는 채점 방식이 달라 성적을 합치지 않는다 — 지금 보고 있는 모드 것만 보여준다
+  const s = QUIZ.mode === 'range'
+    ? (RANGE.state && RANGE.state.scoreboard)
+    : (QUIZ.spots && QUIZ.spots.scoreboard);
+  if (!s || !s.total) return QUIZ.mode === 'range'
+    ? '포지션별 오픈 레인지 드릴' : '내 약점 스팟으로 AI가 문제 출제';
   return `${s.total}문제 풀이 · 정답률 ${s.ok_rate === null ? '—' : s.ok_rate + '%'}`;
 }
 
 function selectQuiz() {
   SEL = -7; renderSidebar();
-  $('#mainhead').innerHTML = '<h2>🎯 문제 풀기</h2>';
   renderQuiz();
   $('#main').scrollTop = 0;
-  if (!QUIZ.spots) qzLoadSpots();
+  if (QUIZ.mode === 'range') { if (!RANGE.state) rgLoadState(); }
+  else if (!QUIZ.spots) qzLoadSpots();
+}
+
+function qzSetMode(m) {
+  QUIZ.mode = m;
+  selectQuiz();
 }
 
 // 필터를 쿼리스트링으로 (빈 배열이면 파라미터 자체를 안 붙인다)
@@ -2959,8 +3002,322 @@ function qzRenderGrade() {
   if (el) el.innerHTML = qzGradeHtml();
 }
 
+// ─────────────────────────────────────────────────────────────
+// 📐 오픈 레인지 드릴 — 서버가 차트를 들고 있고 채점도 서버에서 즉시 끝난다.
+// AI를 전혀 부르지 않으므로 스트리밍도, 캐시도, 생성 폴백도 없다.
+// ─────────────────────────────────────────────────────────────
+let RANGE = {
+  status: 'idle',   // idle | loading | ready | graded | error
+  state: null,      // /api/range/state (토글 선택지 + 성적표)
+  pos: [], stack: [],
+  q: null,          // 현재 문제
+  picked: null,     // 고른 액션 id
+  res: null,        // 채점 결과 (로컬이라 한 번에 온다)
+  chart: null,      // 차트 그리드 (채점 후 '차트 보기'를 눌렀을 때만 받아온다)
+  showChart: false,
+  err: '',
+  showImport: false,
+  imp: {pos: '', stack: '', text: '', source: '', busy: false, err: '', msg: ''},
+};
+
+function rgFilterQS() {
+  const p = [];
+  if (RANGE.pos.length) p.push('pos=' + RANGE.pos.map(encodeURIComponent).join(','));
+  if (RANGE.stack.length) p.push('stack=' + RANGE.stack.join(','));
+  return p.length ? '?' + p.join('&') : '';
+}
+
+async function rgLoadState() {
+  try { RANGE.state = await (await fetch('/api/range/state')).json(); }
+  catch (e) { RANGE.state = {error: String(e)}; }
+  renderSidebar();
+  if (SEL === -7) renderQuiz();
+}
+
+function rgTogglePos(k)   { RANGE.pos   = qzToggleIn(RANGE.pos.slice(), k);   renderQuiz(); }
+function rgToggleStack(k) { RANGE.stack = qzToggleIn(RANGE.stack.slice(), k); renderQuiz(); }
+
+// GTOWizard 등에서 복사한 레인지 텍스트를 (포지션, 스택버킷) 슬롯으로 가져온다 — 내장 차트를 덮어쓴다
+function rgToggleImport() { RANGE.showImport = !RANGE.showImport; renderQuiz(); }
+
+function rgImpSet(k, v) { RANGE.imp[k] = v; RANGE.imp.err = ''; RANGE.imp.msg = ''; renderQuiz(); }
+
+async function rgImport() {
+  const i = RANGE.imp;
+  if (!i.pos || !i.stack) { i.err = '포지션과 스택을 먼저 선택하세요.'; renderQuiz(); return; }
+  if (!i.text.trim()) { i.err = '레인지 텍스트를 붙여넣으세요.'; renderQuiz(); return; }
+  i.busy = true; i.err = ''; i.msg = ''; renderQuiz();
+  try {
+    const res = await fetch('/api/range/import', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pos: i.pos, stack: i.stack, text: i.text, source: i.source}),
+    });
+    const d = await res.json();
+    i.busy = false;
+    if (d.error) {
+      i.err = d.error + (d.warnings && d.warnings.length ? ` (읽지 못한 토큰: ${d.warnings.join(', ')})` : '');
+    } else {
+      i.msg = `${d.pos} · ${d.stack} 가져오기 완료 — ${d.n}콤보, 상위 ${d.pct}% (경계 ${d.mix_pct}%)` +
+              (d.warnings && d.warnings.length ? `. 못 읽은 토큰: ${d.warnings.join(', ')}` : '');
+      i.text = '';
+      await rgLoadState();
+    }
+  } catch (e) { i.busy = false; i.err = String(e); }
+  renderQuiz();
+}
+
+async function rgDeleteChart(pos, stack) {
+  try {
+    await fetch('/api/range/delete-chart', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pos, stack}),
+    });
+    await rgLoadState();
+  } catch (e) {}
+}
+
+function rgImportHtml() {
+  const st = RANGE.state;
+  if (!st || !st.positions) return '';
+  const i = RANGE.imp;
+  const posOpts = st.positions.map(p =>
+    `<option value="${p.key}" ${i.pos === p.key ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  const stackOpts = st.stacks.map(s =>
+    `<option value="${s.key}" ${i.stack === s.key ? 'selected' : ''}>${esc(s.label)}</option>`).join('');
+  const customRows = (st.custom || []).map(c => `
+    <div class="rg-imp-row">
+      <span>${esc(c.pos)} · ${esc(c.stack_label)}</span>
+      <span>${c.pct}% (경계 ${c.mix_pct}%) · ${c.n}콤보${c.source ? ' · ' + esc(c.source) : ''}</span>
+      <button onclick="rgDeleteChart('${c.pos}','${c.stack}')">삭제 (내장 차트로)</button>
+    </div>`).join('');
+  return `<div class="qz-card rg-imp" style="margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer"
+         onclick="rgToggleImport()">
+      <b style="font-size:14px">📥 레인지 가져오기 (GTOWizard 등)</b>
+      <span style="color:var(--dim);font-size:12px">${RANGE.showImport ? '접기 ▲' : '펼치기 ▼'}</span>
+    </div>
+    ${RANGE.showImport ? `
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <select onchange="rgImpSet('pos', this.value)">
+          <option value="">포지션</option>${posOpts}
+        </select>
+        <select onchange="rgImpSet('stack', this.value)">
+          <option value="">스택</option>${stackOpts}
+        </select>
+        <input type="text" placeholder="출처 메모 (선택, 예: GTOWizard 40bb ICM)" value="${esc(i.source)}"
+               oninput="rgImpSet('source', this.value)" style="flex:1;min-width:180px">
+      </div>
+      <textarea rows="4" placeholder="GTOWizard에서 복사한 레인지 텍스트를 붙여넣으세요 (예: AA:100,AKs:87.5,... 또는 22+, ATs+, KQo)"
+                style="width:100%;margin-top:8px;box-sizing:border-box"
+                oninput="rgImpSet('text', this.value)">${esc(i.text)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+        <button class="primary" ${i.busy ? 'disabled' : ''} onclick="rgImport()">가져오기</button>
+        ${i.busy ? '<span class="ai-loading" style="margin:0">가져오는 중</span>' : ''}
+      </div>
+      ${i.err ? `<div style="color:var(--red);margin-top:8px;font-size:13px">${esc(i.err)}</div>` : ''}
+      ${i.msg ? `<div style="color:var(--green);margin-top:8px;font-size:13px">${esc(i.msg)}</div>` : ''}
+      ${customRows ? `<div style="margin-top:14px">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:2px">가져온 차트 (내장 차트를 덮어씀)</div>
+        ${customRows}
+      </div>` : ''}
+    ` : ''}
+  </div>`;
+}
+
+async function rgNext() {
+  RANGE.status = 'loading'; RANGE.q = null; RANGE.picked = null;
+  RANGE.res = null; RANGE.chart = null; RANGE.showChart = false; RANGE.err = '';
+  renderQuiz();
+  try {
+    const d = await (await fetch('/api/range/next' + rgFilterQS())).json();
+    if (d.error) { RANGE.status = 'error'; RANGE.err = d.error; }
+    else { RANGE.q = d.question; RANGE.status = 'ready'; }
+  } catch (e) { RANGE.status = 'error'; RANGE.err = String(e); }
+  renderQuiz();
+}
+
+async function rgAnswer(choice) {
+  if (RANGE.status !== 'ready' || !RANGE.q) return;
+  const q = RANGE.q;
+  RANGE.picked = choice;
+  try {
+    const res = await fetch('/api/range/grade', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pos: q.pos, stack: q.stack, combo: q.combo, choice}),
+    });
+    const d = await res.json();
+    if (d.error) { RANGE.status = 'error'; RANGE.err = d.error; }
+    else {
+      RANGE.res = d; RANGE.status = 'graded';
+      if (RANGE.state) RANGE.state.scoreboard = d.scoreboard;   // 성적표 즉시 갱신
+      renderSidebar();
+    }
+  } catch (e) { RANGE.status = 'error'; RANGE.err = String(e); }
+  renderQuiz();
+}
+
+// 차트는 채점이 끝난 뒤에만 — 먼저 보여주면 정답이 그대로 새어나간다
+async function rgToggleChart() {
+  RANGE.showChart = !RANGE.showChart;
+  const q = RANGE.q;
+  if (RANGE.showChart && q && !RANGE.chart) {
+    renderQuiz();
+    try {
+      RANGE.chart = await (await fetch(
+        `/api/range/chart?pos=${encodeURIComponent(q.pos)}&stack=${q.stack}`)).json();
+    } catch (e) { RANGE.chart = {error: String(e)}; }
+  }
+  renderQuiz();
+}
+
+function rgCardHtml(card) {
+  const g = {s: '♠', h: '♥', d: '♦', c: '♣'}[card[1]];
+  const red = card[1] === 'h' || card[1] === 'd';
+  return `<div class="rg-c${red ? ' red' : ''}">${card[0]}<span>${g}</span></div>`;
+}
+
+function rgQuestionHtml() {
+  if (RANGE.status === 'loading') return '<div class="qz-card"><div class="ai-loading">문제 뽑는 중</div></div>';
+  if (RANGE.status === 'error') return `<div class="qz-card">
+    <div style="color:#ff6b7d;margin-bottom:10px">${esc(RANGE.err)}</div>
+    <button class="primary" onclick="rgNext()">다시 시도</button></div>`;
+  const q = RANGE.q;
+  if (!q) return '';
+  const graded = RANGE.status === 'graded';
+  const btn = (id, label, key) => `
+    <button class="${RANGE.picked === id ? 'picked ' : ''}${!graded && id === 'open' ? 'primary' : ''}"
+            ${graded ? 'disabled' : ''} onclick="rgAnswer('${id}')">
+      ${esc(label)}<span class="rg-key">${key}</span></button>`;
+  return `<div class="qz-card">
+    <div class="qz-head" style="justify-content:center">
+      <span class="qz-tag">${esc(q.pos_label)}</span>
+      <span class="qz-tag street">${esc(q.stack_label)}</span>
+    </div>
+    <div class="rg-ctx">${esc(q.prompt)}<b>${esc(q.verb)}할까요?</b></div>
+    <div class="rg-hero">${q.cards.map(rgCardHtml).join('')}</div>
+    <div class="rg-combo">${esc(q.combo)}</div>
+    <div class="rg-acts">
+      ${btn('open', q.choices[0].label, 'O')}
+      ${btn('fold', '폴드', 'F')}
+    </div>
+    ${graded ? rgResultHtml() : ''}
+  </div>`;
+}
+
+function rgResultHtml() {
+  const r = RANGE.res, q = RANGE.q;
+  if (!r) return '';
+  return `<div class="rg-res">
+    <div class="qz-verdict" style="margin-bottom:8px">
+      <span>${VERDICT_EMOJI[r.grade] || ''}</span>
+      <span class="g qz-g-${r.grade}">${r.grade}</span>
+      <span style="font-size:13px;font-weight:500;color:var(--dim)">
+        차트 정답: ${r.correct === 'open' ? r.verb : (r.correct === 'mix' ? '혼합(경계)' : '폴드')}</span>
+    </div>
+    <div class="why">${mdToHtml(r.text)}</div>
+    <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+      <button class="primary" onclick="rgNext()">다음 문제 →<span class="rg-key">Enter</span></button>
+      <button onclick="rgToggleChart()">${RANGE.showChart ? '차트 접기' : `${esc(q.pos)} · ${esc(q.stack_label)} 차트 보기`}</button>
+    </div>
+    ${RANGE.showChart ? rgChartHtml() : ''}
+  </div>`;
+}
+
+function rgChartHtml() {
+  const c = RANGE.chart;
+  if (!c) return '<div class="ai-loading" style="margin-top:12px">차트 여는 중</div>';
+  if (c.error) return `<div class="qz-note" style="margin-top:12px">${esc(c.error)}</div>`;
+  const BG = {open: 'rgba(77,163,255,.55)', mix: 'rgba(230,180,80,.35)', fold: 'var(--panel2)'};
+  let rows = '<tr><th></th>' + GRID_RANKS.map(r => `<th>${r}</th>`).join('') + '</tr>';
+  for (let i = 0; i < 13; i++) {
+    let tds = `<th>${GRID_RANKS[i]}</th>`;
+    for (let j = 0; j < 13; j++) {
+      const combo = comboLabel(i, j);
+      const d = c.cells[combo] || {v: 'fold'};
+      const cur = RANGE.q && RANGE.q.combo === combo ? ' rg-cur' : '';
+      // 내 실전 오픈 비율이 차트와 크게 어긋나는 칸에 빨간 테두리 — 여기가 리크다
+      const dev = d.rate !== undefined &&
+        ((d.v === 'open' && d.rate < 50) || (d.v === 'fold' && d.rate > 25)) ? ' rg-dev' : '';
+      const t = `${combo} · 차트 ${d.v === 'open' ? c.verb : (d.v === 'mix' ? '혼합' : '폴드')}` +
+        (d.rate === undefined ? ' · 실전 기회 없음' : ` · 실전 ${d.opps}회 중 ${d.opens}회 오픈 (${d.rate}%)`);
+      tds += `<td><div class="hc${i === j ? ' pair' : ''}${cur}${dev}" style="background:${BG[d.v]}" title="${esc(t)}">
+        <div class="lab">${combo}</div>${d.rate === undefined ? '' : `<div class="val">${d.rate}%</div>`}</div></td>`;
+    }
+    rows += `<tr>${tds}</tr>`;
+  }
+  return `<div style="margin-top:14px">
+    <div class="rg-legend">
+      <span><i style="background:${BG.open}"></i>${esc(c.verb)} ${c.pct}%</span>
+      <span><i style="background:${BG.mix}"></i>경계(혼합) ${c.mix_pct}%</span>
+      <span><i style="background:var(--panel2)"></i>폴드</span>
+      <span><i style="box-shadow:inset 0 0 0 1px #ff6b7d"></i>내 실전 기록이 차트와 어긋난 칸</span>
+    </div>
+    <div class="grid-wrap"><table class="hgrid">${rows}</table></div>
+    <div class="qz-note" style="margin-top:8px">숫자는 이 스팟에서 내가 실제로 오픈한 비율입니다
+      (폴드 투 히어로 상황 기준).</div>
+  </div>`;
+}
+
+function rgScoreHtml() {
+  const s = RANGE.state && RANGE.state.scoreboard;
+  if (!s || !s.total) return '';
+  const bp = s.by_pos.map(x =>
+    `<div><span>${esc(x.pos)}</span><b>${x.n ? Math.round(x.ok / x.n * 100) : 0}%</b>
+      <span style="font-size:11px">${x.ok}/${x.n}</span></div>`).join('');
+  return `<h3 style="margin:20px 0 10px;font-size:14px">성적</h3>
+    <div class="qz-score">
+      <div><span>푼 문제</span><b>${s.total}</b></div>
+      <div><span>정답률</span><b>${s.ok_rate === null ? '—' : s.ok_rate + '%'}</b>
+        <span style="font-size:11px">좋음+무난 기준</span></div>
+      ${Object.entries(s.grades).map(([g, n]) =>
+        `<div><span>${VERDICT_EMOJI[g]} ${g}</span><b>${n}</b></div>`).join('')}
+    </div>
+    ${bp ? `<div class="qz-score" style="margin-top:10px">${bp}</div>` : ''}`;
+}
+
+function renderRangeQuiz() {
+  const st = RANGE.state;
+  const filters = st && st.positions ? `
+    ${qzToggleRow('포지션', st.positions, RANGE.pos, 'rgTogglePos')}
+    ${qzToggleRow('스택', st.stacks, RANGE.stack, 'rgToggleStack')}` : '';
+  const note = st && st.personalized === false ? `
+    <div class="qz-note">📊 <code>python3 gui.py --rebuild</code> 를 돌리면 내가 실제로 차트와
+      어긋나게 친 조합이 우선 출제됩니다 — 지금은 균등 무작위로 냅니다.</div>` : `
+    <div class="qz-note">내가 실제로 차트와 어긋나게 친 조합이 더 자주 나옵니다.
+      경계 핸드는 어느 쪽을 골라도 <b>무난</b>입니다.</div>`;
+  $('#hands').innerHTML = `<div class="qz-wrap">
+    ${rgImportHtml()}
+    ${filters}${note}
+    ${RANGE.status === 'idle'
+      ? `<div class="qz-card" style="text-align:center;padding:34px 22px">
+           <div style="font-size:15px;margin-bottom:6px">폴드로 돌아왔을 때 이 핸드를 여나?</div>
+           <div style="color:var(--dim);font-size:13px;margin-bottom:18px">
+             포지션·스택별 오픈 레인지 차트와 대조해 <b>즉시 채점</b>합니다 (AI 호출 없음).</div>
+           <button class="primary" onclick="rgNext()">드릴 시작 →</button></div>`
+      : rgQuestionHtml()}
+    ${rgScoreHtml()}
+  </div>`;
+}
+
+// 속사 드릴이라 키보드로 넘길 수 있게 — 오픈 레인지 모드에서만 반응한다
+document.addEventListener('keydown', e => {
+  if (SEL !== -7 || QUIZ.mode !== 'range') return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+  const k = e.key.toLowerCase();
+  if (RANGE.status === 'ready' && (k === 'o' || k === 'r')) { e.preventDefault(); rgAnswer('open'); }
+  else if (RANGE.status === 'ready' && k === 'f') { e.preventDefault(); rgAnswer('fold'); }
+  else if ((RANGE.status === 'graded' || RANGE.status === 'idle') &&
+           (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); rgNext(); }
+});
+
 function renderQuiz() {
   if (SEL !== -7) return;
+  const mb = (k, l) => `<button class="${QUIZ.mode === k ? 'primary' : ''}" onclick="qzSetMode('${k}')">${l}</button>`;
+  $('#mainhead').innerHTML = `<h2 style="flex:0 0 auto">🎯 문제 풀기</h2>
+    ${mb('hand', '🃏 핸드 리뷰')}${mb('range', '📐 오픈 레인지')}`;
+  if (QUIZ.mode === 'range') return renderRangeQuiz();
   $('#hands').innerHTML = `<div class="qz-wrap">
     ${qzSpotsHtml()}
     ${QUIZ.status === 'idle'
@@ -3050,6 +3407,21 @@ class Handler(BaseHTTPRequestHandler):
                                       hero=HERO, positions=pos, stacks=stacks,
                                       streets=streets)
             self._send(json.dumps(resp, ensure_ascii=False), "application/json; charset=utf-8")
+        elif path == "/api/range/state":
+            self._send(json.dumps(ranges.state_view(DB), ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/range/next":
+            qs = parse_qs(urlparse(self.path).query)
+            pos, stacks, _ = _quiz_filters(qs)
+            resp = ranges.next_question(DB, positions=pos, stacks=stacks)
+            self._send(json.dumps(resp, ensure_ascii=False), "application/json; charset=utf-8")
+        elif path == "/api/range/chart":
+            qs = parse_qs(urlparse(self.path).query)
+            resp = ranges.chart_view(DB, qs.get("pos", [""])[0],
+                                     qs.get("stack", [""])[0])
+            self._send(json.dumps(resp, ensure_ascii=False),
+                       "application/json; charset=utf-8",
+                       code=400 if resp.get("error") else 200)
         elif path == "/api/quiz/reveal":
             qs = parse_qs(urlparse(self.path).query)
             resp = quiz.reveal(DB, qs.get("hand_id", [""])[0],
@@ -3207,6 +3579,50 @@ class Handler(BaseHTTPRequestHandler):
                 quiz.record_attempt(DB, body.get("spot"), hand_id, body.get("street"),
                                     choice_id, grade, generated=body.get("source") == "ai")
                 persist(DB)
+        elif self.path == "/api/range/grade":
+            # 오픈 레인지 채점은 **전부 로컬** — 정답이 차트에 있으므로 AI를 부르지 않는다
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except ValueError:
+                self._send(json.dumps({"error": "잘못된 요청"}, ensure_ascii=False),
+                           "application/json; charset=utf-8", code=400)
+                return
+            resp = ranges.grade(DB, body.get("pos"), body.get("stack"),
+                                body.get("combo"), body.get("choice"))
+            if not resp.get("error"):
+                resp["scoreboard"] = ranges.scoreboard(DB)
+                persist(DB)
+            self._send(json.dumps(resp, ensure_ascii=False),
+                       "application/json; charset=utf-8",
+                       code=400 if resp.get("error") else 200)
+        elif self.path == "/api/range/import":
+            # GTO 툴에서 복사한 레인지 텍스트를 (포지션, 스택버킷) 슬롯에 저장 — 내장 차트를 덮어쓴다
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except ValueError:
+                self._send(json.dumps({"error": "잘못된 요청"}, ensure_ascii=False),
+                           "application/json; charset=utf-8", code=400)
+                return
+            resp = ranges.import_chart(DB, body.get("pos"), body.get("stack"),
+                                       body.get("text"), source=body.get("source"))
+            if resp.get("ok"):
+                persist(DB)
+            self._send(json.dumps(resp, ensure_ascii=False),
+                       "application/json; charset=utf-8",
+                       code=400 if resp.get("error") else 200)
+        elif self.path == "/api/range/delete-chart":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except ValueError:
+                self._send(json.dumps({"error": "잘못된 요청"}, ensure_ascii=False),
+                           "application/json; charset=utf-8", code=400)
+                return
+            resp = ranges.delete_chart(DB, body.get("pos"), body.get("stack"))
+            persist(DB)
+            self._send(json.dumps(resp, ensure_ascii=False), "application/json; charset=utf-8")
         elif self.path == "/api/quiz/gen":
             # 실제 핸드가 소진된 스팟 — AI가 같은 성격의 연습 문제를 새로 만든다
             length = int(self.headers.get("Content-Length", 0))
